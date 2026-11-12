@@ -25,6 +25,13 @@ MAX_ROOT_DELTA = 80         # cap on net delta per underlying (in lots of the ma
 HEDGE_TRIGGER = 40          # roots with options: hedge delta when |delta| exceeds this
 HEDGE_TARGET = 10           # ... down to this
 MAX_LOSS = -3000.0          # emergency stop on session PnL (valued at our fair)
+UNWIND_TRIGGER_FRAC = 0.75  # |exposure| above this share of the limit -> actively trade it down
+UNWIND_MAX_COST_TICKS = 2.0 # ... but only if crossing costs at most this many ticks vs fair
+UNWIND_CHUNK = 5            # lots per unwind trade
+UNWIND_COOLDOWN_S = 2.0     # per root
+REBALANCE_COST_TICKS = 1.0  # pay up to this per lot to flatten offsetting legs (e.g. +60 A / -60 B)
+MAX_CONSECUTIVE_ERRORS = 5 # stop (and pull orders) after this many failed loops in a row
+MAX_BOOK_AGE_S = 5.0        # ignore books older than this (None = off); auto-off if clocks disagree
 
 # ---------------------------------------------------------------------------
 # Quoting
@@ -34,8 +41,11 @@ OPTION_QUOTE_VOLUME = 3
 EDGE_MIN_TICKS = 1
 EDGE_VOL_MULT = 1.5         # edge >= EDGE_VOL_MULT * (1-second fair-value stdev)
 COLD_SPREAD_FRAC = 0.5      # while vol is still unlearned: edge >= this * market half-spread
-SKEW_OWN_TICKS = 3
-SKEW_ROOT_TICKS = 3
+# Skew is measured in units of the current edge, so it scales with volatility.
+# Curve: u + SKEW_CONVEXITY * u^3 (u = position / limit) -> gentle when small, hard near the limit.
+SKEW_OWN = 0.5
+SKEW_ROOT = 0.7
+SKEW_CONVEXITY = 2.0
 REQUOTE_TOL_TICKS = 1
 
 # ---------------------------------------------------------------------------
@@ -53,7 +63,9 @@ DISTRUST_REL = 0.03
 # ---------------------------------------------------------------------------
 # Learning
 # ---------------------------------------------------------------------------
-VOL_HALFLIFE_S = 30.0
+VOL_SAMPLE_S = 5.0          # measure vol over 5s moves: book noise barely counts at that horizon
+VOL_HALFLIFE_S = 120.0
+VOL_MIN_SAMPLES = 20        # vol counts as learned after this many 5s samples (and TIER1_BOOKS)
 BASIS_HALFLIFE = 600        # samples; slow on purpose: learns persistent offsets only
 MARKOUT_S = 5.0             # horizon to judge fills / flows
 MARKOUT_TARGET_TICKS = 0.5  # markout we want per fill; below -> widen, above -> tighten

@@ -206,10 +206,11 @@ B.time = NS(time=lambda: clock[0], strftime=_time.strftime, localtime=_time.loca
             sleep=lambda s: clock.__setitem__(0, clock[0] + s))
 
 
-def run_session(seed, steps, data_dir, state, quiet=True):
+def run_session(seed, steps, data_dir, state, quiet=True, show_report=False):
     ex = FakeExchange(seed, state)
     bot = B.AdaptiveBot(ex, data_dir=data_dir)
     pnl0 = ex.get_pnl()
+    bot.start_pnl = pnl0
     max_abs = 0
     real_print = print
     if quiet:
@@ -220,11 +221,15 @@ def run_session(seed, steps, data_dir, state, quiet=True):
             clock[0] += C.LOOP_SLEEP
             ex.advance()
             max_abs = max(max_abs, max(abs(p) for p in ex.pos.values()))
-        bot.report()          # quiet: just updates bot.session
     finally:
         B.print = real_print
+    if show_report:
+        print("\nLast session report:")
+    else:
+        B.print = lambda *a, **k: None
+    bot.report()
+    B.print = real_print
     pnl = ex.get_pnl() - pnl0
-    bot.session = pnl
     bot.shutdown()
     return bot, ex, pnl, max_abs
 
@@ -237,7 +242,7 @@ def main():
     state = None
     try:
         for s in range(sessions):
-            bot, ex, pnl, mx = run_session(s, steps, data_dir, state)
+            bot, ex, pnl, mx = run_session(s, steps, data_dir, state, show_report=(s == sessions - 1))
             state = ex.state()
             b = bot.brain
             tiers = {i: b.tier(i) for i in bot.instruments}
@@ -248,8 +253,6 @@ def main():
             print(f"           alpha {alpha} | SHARK score {b.name_score('SHARK'):+.2f} (n={shark.get('n')}) | "
                   f"news pause {b.news_pause():.0f}s | arms "
                   f"{ {i: max(a, key=lambda k: a[k]['mean']) for i, a in b.s['bandit'].items() if len(a) > 1} }")
-        print("\nLast session report:")
-        bot.report()
     finally:
         shutil.rmtree(data_dir, ignore_errors=True)
 

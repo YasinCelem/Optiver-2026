@@ -42,6 +42,7 @@ import random
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C                                         # noqa: E402
@@ -70,6 +71,22 @@ def kind_of(inst):
     if t == "INDEX_TRACKING_ETF":
         return "etf"
     return "spot"
+
+
+def book_age_s(book):
+    """Seconds since the book's timestamp, or None if it has none.
+
+    A naive timestamp may be UTC or local time; take whichever reading is
+    closer to now, so a timezone mismatch can't make every book look stale.
+    """
+    ts = getattr(book, "timestamp", None)
+    if not isinstance(ts, datetime):
+        return None
+    if ts.tzinfo is not None:
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    ages = [(datetime.now() - ts).total_seconds(),
+            (datetime.now(timezone.utc).replace(tzinfo=None) - ts).total_seconds()]
+    return min(ages, key=abs)
 
 
 def is_call(inst):
@@ -119,6 +136,8 @@ class AdaptiveBot:
         self.flow, self.iflow = defaultdict(float), defaultdict(float)
         self.features = {}
         self.ioc_ids = set()
+        self.check_age = C.MAX_BOOK_AGE_S is not None
+        self.open_orders = {}
         self.pending_fills, self.pending_alpha, self.pending_names, self.pending_news = [], [], [], []
         self.last_alpha_sample = defaultdict(float)
         self.last_book_log = 0.0
@@ -194,8 +213,21 @@ class AdaptiveBot:
     # ================================================================== market data
     def read_market(self, now, dt):
         self.tobs, self.mid = {}, {}
-        for iid in self.instruments:
-            tob = top_of_book(self.ex.get_last_price_book(iid))
+        books = {iid: self.ex.get_last_price_book(iid) for iid in self.instruments}
+        ages = {iid: book_age_s(b) for iid, b in books.items() if b is not None}
+        ages = {iid: a for iid, a in ages.items() if a is not None}
+        if self.check_age and ages and all(a > 60 for a in ages.values()):
+            # Every book "minutes old" means our clock disagrees with the exchange's,
+            # not that the whole market froze. Don't let that silence the bot.
+            self.check_age = False
+            print(f"WARNING: all books look >60s old (e.g. {max(ages.values()):.0f}s); "
+                  f"clock mismatch? Stale-book check switched OFF.")
+        for iid, book in books.items():
+            age = ages.get(iid)
+            if self.check_age and age is not None and age > C.MAX_BOOK_AGE_S:
+                self.warn(f"stale-{iid}", f"[{iid}] book {age:.1f}s old -> not trading it")
+                continue
+            tob = top_of_book(book)
             if tob:
                 self.tobs[iid] = tob
                 self.mid[iid] = 0.5 * (tob[0] + tob[2])
@@ -500,7 +532,19 @@ class AdaptiveBot:
             d[self.root[iid]] += positions.get(iid, 0) * dl
         return d
 
-    def room(self, iid, side, positions, deltas, use_delta=True):
+    def open_vol(self, iid, side):
+        """Volume of our resting orders on this side (they can still fill)."""
+        return sum(int(o.volume) for o in self.open_orders.get(iid, {}).values() if o.side == side)
+
+    def room(self, iid, side, positions, deltas, use_delta=True, include_open=True):
+        """Lots we may add on `side`. include_open=False when the resting order on
+        that side is about to be replaced (quoting), so it shouldn't count twice."""
+        r = self._room(iid, side, positions, deltas, use_delta)
+        if include_open:
+            r -= self.open_vol(iid, side)
+        return max(0, r)
+
+    def _room(self, iid, side, positions, deltas, use_delta):
         pos = positions.get(iid, 0)
         if side == "bid":
             r, dchg = min(C.MAX_POS - pos, C.POSITION_LIMIT - pos), self.d1.get(iid, 0.0)
@@ -554,9 +598,9 @@ class AdaptiveBot:
                     if profit < C.ARB_MIN_TICKS * tick - 1e-9:
                         continue
                     pa, pb = positions.get(a, 0), positions.get(b, 0)
-                    vol_a = min(bv_a, int(av_b / ratio), C.MAX_TAKE_VOLUME,
-                                C.MAX_POS + pa, C.POSITION_LIMIT + pa,
-                                int((min(C.MAX_POS - pb, C.POSITION_LIMIT - pb)) / ratio))
+                    sell_a = min(C.MAX_POS + pa, C.POSITION_LIMIT + pa) - self.open_vol(a, "ask")
+                    buy_b = min(C.MAX_POS - pb, C.POSITION_LIMIT - pb) - self.open_vol(b, "bid")
+                    vol_a = min(bv_a, int(av_b / ratio), C.MAX_TAKE_VOLUME, sell_a, int(buy_b / ratio))
                     vol_b = int(round(vol_a * ratio))
                     if vol_a < 1 or vol_b < 1:
                         continue
@@ -634,8 +678,8 @@ class AdaptiveBot:
         if bid >= ask:
             return None
         size = C.OPTION_QUOTE_VOLUME if self.kind[iid] == "option" else C.QUOTE_VOLUME
-        vb = min(size, self.room(iid, "bid", positions, deltas))
-        va = min(size, self.room(iid, "ask", positions, deltas))
+        vb = min(size, self.room(iid, "bid", positions, deltas, include_open=False))
+        va = min(size, self.room(iid, "ask", positions, deltas, include_open=False))
         pl = getattr(inst, "price_limit", None)
         if bid < tick or (pl and bid < pl.min):
             vb = 0
@@ -653,7 +697,14 @@ class AdaptiveBot:
             if safe and volume / 2 <= o.volume <= volume:
                 return
         for o in mine:
-            self.ex.delete_order(iid, order_id=o.order_id)
+            resp = self.ex.delete_order(iid, order_id=o.order_id)
+            if resp is not None and not getattr(resp, "success", True):
+                self.warn(f"del-{iid}-{side}", f"[{iid}] delete {side} {o.order_id} failed: "
+                          f"{getattr(resp, 'error_reason', '?')} -> not re-quoting this loop")
+                return
+        if mine and any(o.side == side for o in self.ex.get_outstanding_orders(iid).values()):
+            # Old order still live (failed or racing cancel): never stack a second one.
+            return
         if volume > 0:
             resp = self.ex.insert_order(iid, price=price, volume=int(volume), side=side, order_type="limit")
             if not resp.success:
@@ -662,7 +713,9 @@ class AdaptiveBot:
     def quote(self, positions, deltas, paused):
         for iid in self.instruments:
             try:
-                outstanding = self.ex.get_outstanding_orders(iid)
+                outstanding = self.open_orders.get(iid)
+                if outstanding is None:
+                    outstanding = self.ex.get_outstanding_orders(iid)
                 q = None
                 if not paused and iid in self.tobs and iid in self.fair:
                     q = self.target_quotes(iid, positions, deltas)
@@ -687,6 +740,7 @@ class AdaptiveBot:
         self.learn(now, dt)
 
         paused = now < self.pause_until
+        self.open_orders = {iid: self.ex.get_outstanding_orders(iid) for iid in self.instruments}
         positions = self.ex.get_positions()
         deltas = self.root_deltas(positions)
         traded = self.arbitrage(positions)
@@ -757,6 +811,7 @@ class AdaptiveBot:
             print(f"Index definitions: {self.index_def}")
         print(f"Brain: session #{self.brain.s['sessions']}, data in {self.brain.path}")
         last_report = last_save = 0.0
+        errors = 0
         try:
             while True:
                 if not self.ex.is_connected():
@@ -764,8 +819,13 @@ class AdaptiveBot:
                     break
                 try:
                     self.step()
+                    errors = 0
                 except Exception as e:
-                    self.warn("step", f"loop error: {e!r}")
+                    errors += 1
+                    print(f"loop error {errors}/{C.MAX_CONSECUTIVE_ERRORS}: {e!r}")
+                    if errors >= C.MAX_CONSECUTIVE_ERRORS:
+                        print("Too many consecutive errors. Pulling orders and stopping.")
+                        break
                 now = time.time()
                 if now - last_report >= C.REPORT_EVERY:
                     last_report = now
