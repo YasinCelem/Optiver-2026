@@ -72,6 +72,10 @@ VOL_HALFLIFE_LOOPS = 40     # EMA-halfwaardetijd in loops
 LOOP_SLEEP = 0.25           # seconden (houd >= 0.2 i.v.m. rate limits)
 REPORT_EVERY = 10.0         # seconden tussen statusregels
 
+# Analytics
+MARKOUT_SECONDS = 5.0       # na hoeveel sec we checken of een fill goed was
+ANALYTICS_CSV = "mm_analytics.csv"   # None = niet wegschrijven
+
 EPS = 1e-9
 
 
@@ -124,6 +128,128 @@ class Throttle:
 
 
 # ----------------------------------------------------------------------------
+# Analytics
+# ----------------------------------------------------------------------------
+class Analytics:
+    """
+    Houdt bij hoe de bot presteert:
+      - PnL nu, PnL sinds start, PnL per minuut
+      - Edge bij fill: hoeveel beter dan fair value we handelden (ticks en bps)
+      - Markout win-rate: % fills dat MARKOUT_SECONDS later nog winstgevend is
+        t.o.v. de fair value (laag = we worden geplukt / adverse selection)
+      - Rendement op omzet: sessie-PnL / verhandelde notional (bps)
+      - Market share: ons volume / totaal marktvolume per instrument
+      - Markt sinds start: % koersverandering per instrument (benchmark)
+    """
+
+    def __init__(self, instruments):
+        self.instruments = instruments
+        self.start_time = time.time()
+        self.start_pnl = None
+        self.start_fair = {}
+        self.lots = 0
+        self.notional = 0.0
+        self.edge_cash = 0.0          # som van (fair - prijs) * sgn * volume op fill-moment
+        self.edge_ticks = 0.0         # idem in ticks
+        self.pending = []             # fills die nog op hun markout wachten
+        self.markout_wins = 0
+        self.markout_total = 0
+        self.markout_cash = 0.0
+        self.last_fair = {}
+        self.our_volume = defaultdict(int)
+        self.market_volume = defaultdict(int)
+        self._csv_header_written = False
+
+    def on_step(self, ex, fair):
+        now = time.time()
+        self.last_fair = dict(fair)
+        for iid, inst in self.instruments.items():
+            for t in ex.poll_new_trades(iid):
+                sgn = 1 if t.side == "bid" else -1
+                self.lots += t.volume
+                self.notional += t.price * t.volume
+                self.our_volume[iid] += t.volume
+                f = fair.get(iid)
+                if f is not None:
+                    self.edge_cash += (f - t.price) * sgn * t.volume
+                    self.edge_ticks += (f - t.price) * sgn * t.volume / inst.tick_size
+                    self.pending.append((now, iid, sgn, t.price, t.volume))
+            for tick in ex.poll_new_trade_ticks(iid):
+                self.market_volume[iid] += tick.volume
+            if iid in fair and iid not in self.start_fair:
+                self.start_fair[iid] = fair[iid]
+
+        # Markout: was de fill na X seconden nog goed?
+        still = []
+        for item in self.pending:
+            ts, iid, sgn, price, vol = item
+            if now - ts < MARKOUT_SECONDS or iid not in fair:
+                still.append(item)
+                continue
+            pnl = (fair[iid] - price) * sgn * vol
+            self.markout_total += vol
+            self.markout_cash += pnl
+            if pnl > 0:
+                self.markout_wins += vol
+        self.pending = still
+
+    def report(self, pnl, positions, nets):
+        elapsed = time.time() - self.start_time
+        if pnl is not None and self.start_pnl is None:
+            self.start_pnl = pnl
+        session = (pnl - self.start_pnl) if (pnl is not None and self.start_pnl is not None) else None
+        per_min = session / (elapsed / 60) if (session is not None and elapsed > 60) else None
+
+        def pct(a, b):
+            return 100.0 * a / b if b else None
+
+        def fmt(x, spec="+.2f", suffix=""):
+            return "n/a" if x is None else f"{x:{spec}}{suffix}"
+
+        avg_edge_ticks = self.edge_ticks / self.lots if self.lots else None
+        edge_bps = 1e4 * self.edge_cash / self.notional if self.notional else None
+        win_rate = pct(self.markout_wins, self.markout_total)
+        markout_bps = 1e4 * self.markout_cash / self.notional if self.notional else None
+        ret_bps = 1e4 * session / self.notional if (session is not None and self.notional) else None
+
+        share = {i: pct(self.our_volume[i], self.market_volume[i]) for i in self.instruments
+                 if self.market_volume[i]}
+        mkt = {}
+        for iid, f0 in self.start_fair.items():
+            f = self.last_fair.get(iid)
+            if f is not None and f0:
+                mkt[iid] = 100.0 * (f - f0) / f0
+
+        h, rem = divmod(int(elapsed), 3600)
+        print(f"\n=== {time.strftime('%H:%M:%S')} | running {h:02d}:{rem // 60:02d}:{rem % 60:02d} ===")
+        print(f"PnL now: {fmt(pnl, '.2f')} | since start: {fmt(session)} | per min: {fmt(per_min)}")
+        print(f"Fills: {self.lots} lots | notional {self.notional:,.0f} | return on turnover: {fmt(ret_bps, '+.1f', ' bps')}")
+        print(f"Edge at fill: {fmt(avg_edge_ticks, '+.2f', ' ticks')} ({fmt(edge_bps, '+.1f', ' bps')}) | "
+              f"markout {MARKOUT_SECONDS:.0f}s: win-rate {fmt(win_rate, '.0f', '%')}, {fmt(markout_bps, '+.1f', ' bps')}")
+        print("Market share: " + (", ".join(f"{i} {v:.1f}%" for i, v in share.items()) or "n/a"))
+        print("Market since start: " + (", ".join(f"{i} {v:+.2f}%" for i, v in mkt.items()) or "n/a"))
+        print(f"Positions: {positions} | group net: {nets}")
+
+        if ANALYTICS_CSV:
+            self._write_csv([time.strftime('%Y-%m-%d %H:%M:%S'), round(elapsed), pnl, session, self.lots,
+                             round(self.notional, 2), avg_edge_ticks, win_rate, ret_bps])
+        return session
+
+    def _write_csv(self, row):
+        import csv
+        try:
+            with open(ANALYTICS_CSV, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if not self._csv_header_written:
+                    w.writerow(["time", "elapsed_s", "pnl", "session_pnl", "lots", "notional",
+                                "edge_ticks", "markout_winrate_pct", "return_bps"])
+                    self._csv_header_written = True
+                w.writerow(row)
+        except OSError as e:
+            print(f"CSV schrijven faalde: {e}")
+
+
+# ----------------------------------------------------------------------------
 # Bot
 # ----------------------------------------------------------------------------
 class MarketMaker:
@@ -135,7 +261,7 @@ class MarketMaker:
         self.sigma = {}                      # EMA van |delta fair| per instrument
         self.prev_fair = {}
         self.alpha = 1 - 0.5 ** (1.0 / VOL_HALFLIFE_LOOPS)
-        self.fills = defaultdict(int)
+        self.analytics = Analytics(self.instruments)
 
     # -- setup ---------------------------------------------------------------
     def _select_instruments(self):
@@ -339,11 +465,6 @@ class MarketMaker:
                 self.log(f"err-{iid}", f"[{iid}] fout bij quoten: {e}")
 
     # -- loop ----------------------------------------------------------------
-    def poll_fills(self):
-        for iid in self.instruments:
-            for t in self.ex.poll_new_trades(iid):
-                self.fills[iid] += t.volume
-
     def pull_all(self):
         for iid in self.instruments:
             try:
@@ -364,10 +485,11 @@ class MarketMaker:
         if self.arbitrage(tobs, positions) | self.take_mispriced(tobs, fair, positions):
             positions = self.ex.get_positions()   # na IOC's opnieuw ophalen
         self.quote(tobs, fair, positions)
-        self.poll_fills()
+        self.analytics.on_step(self.ex, fair)
         return fair
 
     def report(self, fair):
+        """Print analytics; geeft sessie-PnL terug (PnL sinds de bot startte)."""
         try:
             pnl = self.ex.get_pnl(valuations=fair) if fair else self.ex.get_pnl()
         except Exception:
@@ -375,10 +497,7 @@ class MarketMaker:
         nonzero = {k: v for k, v in self.ex.get_positions().items() if v}
         nets = {g: sum(nonzero.get(m, 0) for m in ms) for g, ms in self.groups.items()}
         nets = {g: n for g, n in nets.items() if n}
-        pnl_str = f"{pnl:.2f}" if pnl is not None else "n/a"
-        print(f"{time.strftime('%H:%M:%S')}  PnL={pnl_str}  pos={nonzero}  groepsnetto={nets}  "
-              f"fills={dict(self.fills)}")
-        return pnl
+        return self.analytics.report(pnl, nonzero, nets)
 
     def run(self):
         print(f"Instrumenten: {list(self.instruments)}")
@@ -397,9 +516,9 @@ class MarketMaker:
 
                 if time.time() - last_report >= REPORT_EVERY:
                     last_report = time.time()
-                    pnl = self.report(fair)
-                    if pnl is not None and pnl < MAX_LOSS:
-                        print(f"PnL {pnl:.2f} < MAX_LOSS {MAX_LOSS}. Orders trekken en stoppen.")
+                    session = self.report(fair)
+                    if session is not None and session < MAX_LOSS:
+                        print(f"Sessie-PnL {session:.2f} < MAX_LOSS {MAX_LOSS}. Orders trekken en stoppen.")
                         break
                 time.sleep(LOOP_SLEEP)
         except KeyboardInterrupt:
