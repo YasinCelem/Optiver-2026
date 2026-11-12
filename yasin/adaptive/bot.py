@@ -1,40 +1,42 @@
 """
-Adaptive market maker: starts with pricing models that need no data and
-unlocks data-driven features as its saved data grows.
+Adaptive market maker.
 
-TIER 0  (always on, from the first second; no data needed)
-  - Dual listings: one shared fair value (liquidity-weighted microprice).
-  - Futures: fair = underlying * exp(r*T).
-  - ETFs: fair = index(constituents, divisor) * multiplier + cash component.
-  - Options: Black-Scholes, using index_volatility if given, else market implied vol.
-  - Cross-instrument arbitrage, IOC takes on big mispricings, delta hedging.
-  - Conservative quoting while vol is unknown (edge >= half the market half-spread).
-  - Pause quoting on news posts.
-  - Model sanity check: if a model price is persistently >3% off the market,
-    fall back to the book for that instrument.
+FAIR VALUE
+  - Stocks: the exchange "walls" (narrow stocks: 3000-lot ladder, wide: 1000-lot) sit around
+    the true value; their midpoint is our fair value (top of book = other teams' small orders).
+  - Lead-lag: NBIS/CRWV/SNDK copy AVGO/MU/NVDA ~1-3 s later; the expected catch-up is added.
+  - Dual listings / futures / ETFs / options: no-arbitrage models on top of that.
 
-TIER 1  (>= TIER1_BOOKS book samples per instrument)
-  - Learned volatility sets the quoting edge (no longer tied to the spread).
-  - Learned basis: persistent market-vs-model offset gets corrected.
-  - Options: per-strike implied vols, fitted to a quadratic smile.
+QUOTING
+  - Narrow stocks at the touch, wide stocks >= 2 ticks from the inventory-adjusted fair; one tick
+    in front of the best competitor with real size (ignores 1-lot decoys); between the walls.
+  - CLOCK: walls only move once a second at a fixed phase per stock -> learn it, and pull
+    narrow-stock quotes from 120 ms before to 80 ms after (fills there lose ~1.4 ticks/lot).
+  - Takes other teams' quotes 1 (narrow) / 2 (wide) ticks on the wrong side of fair.
+  - Per-stock sizes (QUOTE_SIZES), skew on own position and on net exposure, where
+    correlated pairs (PAIRS) and ETF-vs-constituents offset each other.
 
-TIER 2  (>= TIER2_FILLS passive fills per instrument)
-  - Adverse selection: each side widens or tightens by its own 5s markout.
-  - Counterparty scoring: aggressors whose trades predict moves become a signal.
-  - News: learns whether posts move prices; stops pausing if they don't.
+PROTECTION
+  - Vol pause: fair moves >= JUMP_TICKS within JUMP_WINDOW_S -> stand aside on the stock and its
+    pair partners; huge jumps (restart) must persist before we trust them. Refill block after fills.
+  - Soft caps 40 (narrow) / 60 (wide), hard cut at 80 with a bounded IOC. Requests paced.
+  - Request limiter, unwind / rebalance near limits, MAX_LOSS stop, news pause.
 
-TIER 3  (>= TIER3_FILLS fills / TIER3_SAMPLES samples)
-  - Bandit chooses the edge multiplier per instrument by realised markout PnL.
-  - Ridge regression predicts the 5s mid move from imbalance, trade flow,
-    model deviation and informed flow; it is only used when it beats
-    "predict zero" out of sample.
+LEARNING (confidence weighting -- nothing switches on/off at a threshold)
+  - Volatility: live estimate, with history (pretrain.py) as a small prior worth
+    HIST_PRIOR_VOL_SAMPLES live samples that drops out when live data disagrees.
+  - Adverse selection per side, counterparty scores: effect grows with live evidence.
+  - Prediction model: effect = live-proven improvement over "no move" x live evidence.
+  - Bandit on the edge multiplier after TIER3_FILLS live fills.
+  - Tiers T0..T3 in the report are display only.
 
 Everything learned is saved in data/brain.json. Raw logs go to data/raw/<session>/.
-Every session appends a line to data/sessions.csv, so you can see whether it improves.
+Every session appends a line to data/sessions.csv.
 
 Run:  python yasin/adaptive/bot.py         Stop: Ctrl+C (orders are pulled).
 Reset what it learned: delete yasin/adaptive/data/brain.json
 """
+import cmath
 import logging
 import math
 import os
@@ -89,6 +91,24 @@ def book_age_s(book):
     return min(ages, key=abs)
 
 
+def find_walls(book, tick):
+    """The exchange's wall ladders. Narrow stocks: innermost level >= WALL_BIG lots
+    (3000/2000/1000 ladder); wide stocks: >= WALL_SMALL (1000/750/500). Their midpoint is the
+    exchange's own fair value; the top of book is usually small orders from other teams.
+    Returns (wall_bid, wall_ask, narrow) or None."""
+    def first(levels, vmin):
+        return next((lv.price for lv in levels if lv.volume >= vmin), None)
+    wb, wa, narrow = first(book.bids, C.WALL_BIG), first(book.asks, C.WALL_BIG), True
+    if wb is None or wa is None:
+        wb, wa, narrow = first(book.bids, C.WALL_SMALL), first(book.asks, C.WALL_SMALL), False
+    if wb is None or wa is None:
+        return None
+    spread = (wa - wb) / tick
+    if not 2 - 1e-6 <= spread <= C.MAX_WALL_SPREAD_TICKS:
+        return None
+    return wb, wa, narrow
+
+
 def is_call(inst):
     k = inst.option_kind
     return getattr(k, "name", str(k)).upper().endswith("CALL")
@@ -118,6 +138,7 @@ class RateLimiter:
     def __init__(self, per_s):
         self.per_s = per_s
         self.ts = deque()
+        self.last = 0.0
 
     def available(self):
         now = time.time()
@@ -130,6 +151,13 @@ class RateLimiter:
             return False
         self.ts.extend([time.time()] * n)
         return True
+
+    def pace(self):
+        """Keep at least ACTION_GAP_S between two requests (no bursts)."""
+        wait = self.last + C.ACTION_GAP_S - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.time()
 
 
 class AdaptiveBot:
@@ -155,6 +183,22 @@ class AdaptiveBot:
 
         # live state (not persisted)
         self.tobs, self.mid, self.fair, self.fair_pre, self.theo = {}, {}, {}, {}, {}
+        self.books, self.walls = {}, {}
+        self.ref_hist = defaultdict(deque)
+        self.guard_until, self.cooldown_until = {}, {}
+        self.jumps = 0
+        self.partners = self._pair_partners()
+        self.narrow = {}                                  # iid -> True (3000-lot walls) / False (1000-lot)
+        self.prev_wall_mid = {}
+        self.jump_cand = {}
+        self.chg_phase = defaultdict(lambda: deque(maxlen=30))   # local-clock fraction of a second at wall moves
+        self.phase = {}                                   # learned clock phase per stock
+        self.blackouts = 0
+        self.debt = {}                                    # lead-lag: follower -> expected move still owed (ticks)
+        self.ll_prev, self.debt_since, self.ll_t = {}, {}, None
+        self.last_take = defaultdict(float)
+        self.last_cut = {}
+        self.order_t = {}                                 # (iid, side) -> when our current quote was placed
         self.affine, self.d1, self.U, self.eff = {}, {}, {}, {}
         self.vol_anchor, self.prev_t = {}, None
         self.last_unwind = defaultdict(float)
@@ -220,6 +264,24 @@ class AdaptiveBot:
                 print(f"[{iid}] index constituents not all tradable; using books for its value")
         return defs
 
+    def _pair_partners(self):
+        """{iid: [(partner, corr), ...]} for configured correlated pairs that are both tradable."""
+        out = defaultdict(list)
+        for a, b, rho in C.PAIRS:
+            if a in self.instruments and b in self.instruments:
+                out[a].append((b, rho))
+                out[b].append((a, rho))
+        if out:
+            print(f"Correlated pairs: { {k: v for k, v in out.items()} }")
+        return dict(out)
+
+    def ref_price(self, iid):
+        """Wall mid when the exchange walls are visible, else microprice."""
+        w = self.walls.get(iid)
+        if w:
+            return 0.5 * (w[0] + w[1])
+        return microprice(self.tobs[iid])
+
     def _basket_units(self):
         """For each ETF/future on an index we know: the smallest whole-lot trade
         (n0 lots of it vs integer lots of each constituent) that is fully hedged."""
@@ -258,8 +320,61 @@ class AdaptiveBot:
         return None
 
     # ================================================================== market data
+    def _check_jumps(self, now):
+        """Fair moved >= JUMP_TICKS within JUMP_WINDOW_S: stand aside on the stock and its pair
+        partners for JUMP_PAUSE_S. (Normal 1-second wall moves are handled by the clock blackout.)"""
+        for iid, ref in self.mid.items():
+            hist = self.ref_hist[iid]
+            hist.append((now, ref))
+            while len(hist) > 1 and now - hist[0][0] > C.JUMP_WINDOW_S:
+                hist.popleft()
+            tick = self.instruments[iid].tick_size
+            lo = min(p for _, p in hist)
+            hi = max(p for _, p in hist)
+            if hi - lo >= C.JUMP_TICKS * tick - 1e-9:
+                if now >= self.guard_until.get(iid, 0.0):
+                    self.jumps += 1
+                    print(f"JUMP {iid}: {(hi - lo) / tick:.1f} ticks in {C.JUMP_WINDOW_S:.0f}s -> standing aside "
+                          f"{[iid] + [p for p, _ in self.partners.get(iid, [])]} for {C.JUMP_PAUSE_S:.0f}s")
+                for j in [iid] + [p for p, _ in self.partners.get(iid, [])]:
+                    self.guard_until[j] = max(self.guard_until.get(j, 0.0), now + C.JUMP_PAUSE_S)
+
+    # ---------------------------------------------------------------- clock
+    def _learn_phase(self, iid, now):
+        """Walls move at a fixed fraction of each second; estimate it on our own clock
+        (circular mean, trusted only when the observations cluster tightly)."""
+        ch = self.chg_phase[iid]
+        ch.append(now % 1.0)
+        if len(ch) < C.CLOCK_MIN_SAMPLES:
+            return
+        z = sum(cmath.exp(2j * math.pi * f) for f in ch) / len(ch)
+        if abs(z) >= C.CLOCK_MIN_R:
+            # we notice a move up to one loop late: shift back by half a loop
+            self.phase[iid] = (cmath.phase(z) / (2 * math.pi) - C.LOOP_SLEEP / 2) % 1.0
+        else:
+            self.phase.pop(iid, None)
+
+    def in_blackout(self, iid, now):
+        """True around the instant this stock's walls can move: nothing of ours may rest then."""
+        if not C.CLOCK_AWARE or iid not in self.phase:
+            return False
+        if not self.narrow.get(iid, False) and not C.CLOCK_WIDE:
+            return False
+        d = (now - self.phase[iid]) % 1.0                 # seconds since the expected move
+        pre = max(C.CLOCK_PRE_S, C.LOOP_SLEEP + 0.08)
+        return d > 1.0 - pre or d < C.CLOCK_POST_S
+
+    def cap(self, iid):
+        """Soft position cap: per wall type for stocks, MAX_POS otherwise."""
+        if iid in self.narrow:
+            return C.SOFT_CAP_NARROW if self.narrow[iid] else C.SOFT_CAP_WIDE
+        return C.MAX_POS
+
+    def guarded(self, iid, now=None):
+        return (now if now is not None else time.time()) < self.guard_until.get(iid, 0.0)
+
     def read_market(self, now, dt):
-        self.tobs, self.mid = {}, {}
+        self.tobs, self.mid, self.books, self.walls = {}, {}, {}, {}
         books = {iid: self.ex.get_last_price_book(iid) for iid in self.instruments}
         ages = {iid: book_age_s(b) for iid, b in books.items() if b is not None}
         ages = {iid: a for iid, a in ages.items() if a is not None}
@@ -277,7 +392,31 @@ class AdaptiveBot:
             tob = top_of_book(book)
             if tob:
                 self.tobs[iid] = tob
-                self.mid[iid] = 0.5 * (tob[0] + tob[2])
+                self.books[iid] = book
+                tick = self.instruments[iid].tick_size
+                walls = find_walls(book, tick) if C.USE_WALLS and self.kind[iid] != "option" else None
+                if walls:
+                    wm = 0.5 * (walls[0] + walls[1])
+                    prev = self.prev_wall_mid.get(iid)
+                    if prev is not None and abs(wm - prev) > C.JUMP_CONFIRM_TICKS * tick:
+                        # huge jump (e.g. exchange restart): believe it only once it persists
+                        cand = self.jump_cand.get(iid)
+                        if not cand or abs(cand[0] - wm) > 1e-9:
+                            self.jump_cand[iid] = (wm, now)
+                        if now - self.jump_cand[iid][1] < C.JUMP_CONFIRM_S:
+                            self.guard_until[iid] = max(self.guard_until.get(iid, 0.0), now + C.JUMP_CONFIRM_S)
+                            walls = None
+                    if walls:
+                        self.jump_cand.pop(iid, None)
+                        if prev is not None and abs(wm - prev) > 1e-9 and abs(wm - prev) <= C.JUMP_CONFIRM_TICKS * tick:
+                            self._learn_phase(iid, now)
+                        self.prev_wall_mid[iid] = wm
+                        self.narrow[iid] = walls[2]
+                self.walls[iid] = walls
+                # reference price: exchange wall mid (true value) when present, else plain mid
+                self.mid[iid] = 0.5 * (walls[0] + walls[1]) if walls else 0.5 * (tob[0] + tob[2])
+        if C.JUMP_GUARD:
+            self._check_jumps(now)
 
         decay = 0.5 ** (dt / 5.0) if dt > 0 else 1.0
         for iid in self.instruments:
@@ -330,12 +469,12 @@ class AdaptiveBot:
                 theo = a * U + b
                 self.theo[iid] = theo
                 if iid in self.tobs:
-                    micro = microprice(self.tobs[iid])
+                    micro = self.ref_price(iid)
                     self.brain.update_basis(iid, micro - theo, abs(micro - theo) / max(abs(theo), 1e-9))
                 if self.brain.model_trusted(iid):
                     self.fair_pre[iid] = theo + self.brain.basis(iid)
                 elif iid in self.tobs:
-                    self.fair_pre[iid] = microprice(self.tobs[iid])
+                    self.fair_pre[iid] = self.ref_price(iid)
                     self.warn(f"distrust-{iid}", f"[{iid}] model off by "
                               f"{100 * self.brain.inst(iid)['rel_err']:.1f}% -> using its own book")
 
@@ -344,12 +483,46 @@ class AdaptiveBot:
             if self.kind[iid] == "option":
                 self._price_option(iid)
 
-        # short-term alpha on top of the model (only once it validates)
+        # short-term alpha on top of the model (only once it validates) + lead-lag debt
+        self._update_debts(time.time())
         for iid, f in self.fair_pre.items():
             x = self._features(iid, f)
             self.features[iid] = x
+            tick = self.instruments[iid].tick_size
             pred = self.brain.predict(type_name(self.instruments[iid]), x) if x else 0.0
-            self.fair[iid] = f + C.ALPHA_WEIGHT * pred * self.instruments[iid].tick_size
+            self.fair[iid] = f + C.ALPHA_WEIGHT * pred * tick + self.debt.get(iid, 0.0) * tick
+
+    def _update_debts(self, now):
+        """Lead-lag: a leader's move is 'owed' by its follower (beta x the move, in follower
+        ticks); the follower moving the same way pays it back. Unpaid debt fades and times out.
+        Follower moves on their own create no debt (fair value has no momentum by itself)."""
+        dt = now - self.ll_t if self.ll_t is not None else 0.0
+        self.ll_t = now
+        for fol, (lead, beta) in C.LEADS.items():
+            if fol not in self.fair_pre or lead not in self.fair_pre or not self.walls.get(fol) \
+                    or not self.walls.get(lead):
+                continue
+            fa = self.fair_pre[lead] / self.instruments[lead].tick_size
+            fb = self.fair_pre[fol] / self.instruments[fol].tick_size
+            pa, pb = self.ll_prev.get(fol, (fa, fb))
+            self.ll_prev[fol] = (fa, fb)
+            d0 = self.debt.get(fol, 0.0) + beta * (fa - pa)
+            df = fb - pb
+            if d0 > 0:
+                d = max(0.0, d0 - df) if df > 0 else d0
+            elif d0 < 0:
+                d = min(0.0, d0 - df) if df < 0 else d0
+            else:
+                d = 0.0
+            d -= math.copysign(min(abs(d), C.LL_LEAK_TICKS_S * dt), d)
+            d = clip(d, -C.LL_CAP_TICKS, C.LL_CAP_TICKS)
+            if abs(d) >= C.LL_MIN_TICKS:
+                if now - self.debt_since.setdefault(fol, now) > C.LL_TIMEOUT_S:
+                    d = 0.0                                # the follower never moved: forget it
+                    self.debt_since.pop(fol, None)
+            else:
+                self.debt_since.pop(fol, None)
+            self.debt[fol] = d
 
     def _ref_a(self, root):
         for iid in self.members[root]:
@@ -375,7 +548,7 @@ class AdaptiveBot:
                 a, b = self.affine[iid]
                 tob = self.tobs[iid]
                 w = (tob[1] + tob[3]) * (0.5 if self.kind[iid] == "future" else 1.0)
-                num += w * (microprice(tob) - b) / a
+                num += w * (self.ref_price(iid) - b) / a
                 den += w
             return num / den if den > 0 else None
         v = collect(True)
@@ -568,6 +741,8 @@ class AdaptiveBot:
             st["fills"] += 1
             if not aggressive:
                 st["passive_fills"] += 1
+                self.cooldown_until[(iid, t.side)] = now + C.FILL_COOLDOWN_S
+                self.order_t.pop((iid, t.side), None)
             self.lots += t.volume
             self.notional += abs(t.price * t.volume)
             ep = None if aggressive else self.epoch.get(iid)
@@ -601,8 +776,26 @@ class AdaptiveBot:
                 den += h * h
             if den > 0:
                 eff[R] += (num / den) / ref_a                # index units the stocks represent
+        # correlated pairs: a partner's position counts PAIR_NET_FACTOR x corr x vol ratio
+        for iid, plist in self.partners.items():
+            ra = self.root[iid]
+            for p, rho in plist:
+                rb = self.root[p]
+                if rb != ra:
+                    eff[ra] += self.pair_weight(iid, p, rho) * raw.get(rb, 0.0)
         self.eff = eff
         return raw
+
+    def pair_weight(self, iid, partner, rho):
+        """Lots of `iid` that one lot of `partner` behaves like (volatility-matched)."""
+        sa, sb = self.brain.sigma_1s(iid), self.brain.sigma_1s(partner)
+        if sa > 0 and sb > 0:
+            ratio = sb / sa
+        elif iid in self.mid and partner in self.mid and self.mid[iid] > 0:
+            ratio = self.mid[partner] / self.mid[iid]
+        else:
+            ratio = 1.0
+        return C.PAIR_NET_FACTOR * rho * ratio
 
     @staticmethod
     def _curve(u):
@@ -623,13 +816,15 @@ class AdaptiveBot:
 
     def _room(self, iid, side, positions, deltas, use_delta):
         pos = positions.get(iid, 0)
+        cap = self.cap(iid)
         if side == "bid":
-            r, dchg = min(C.MAX_POS - pos, C.POSITION_LIMIT - pos), self.d1.get(iid, 0.0)
+            r, dchg = min(cap - pos, C.POSITION_LIMIT - pos), self.d1.get(iid, 0.0)
         else:
-            r, dchg = min(C.MAX_POS + pos, C.POSITION_LIMIT + pos), -self.d1.get(iid, 0.0)
+            r, dchg = min(cap + pos, C.POSITION_LIMIT + pos), -self.d1.get(iid, 0.0)
         if use_delta and abs(dchg) > 1e-9:
             rd = deltas.get(self.root[iid], 0.0)
-            lim = (C.MAX_ROOT_DELTA - rd) / dchg if dchg > 0 else (C.MAX_ROOT_DELTA + rd) / -dchg
+            root_cap = min(C.MAX_ROOT_DELTA, cap) if iid in self.narrow else C.MAX_ROOT_DELTA
+            lim = (root_cap - rd) / dchg if dchg > 0 else (root_cap + rd) / -dchg
             r = min(r, math.floor(lim + 1e-9))
         return max(0, int(r))
 
@@ -640,6 +835,7 @@ class AdaptiveBot:
         if not self.rl.take():
             self.throttled += 1
             return 0
+        self.rl.pace()
         resp = self.ex.insert_order(iid, price=price, volume=volume, side=side, order_type="ioc")
         if not resp.success:
             self.warn(f"ioc-{iid}", f"[{iid}] IOC {side} {volume}@{price} rejected: {resp.error_reason}")
@@ -749,8 +945,13 @@ class AdaptiveBot:
                 continue
             side = "ask" if x > 0 else "bid"
             best = None
-            for m in mem:
-                dl = self.d1.get(m, 0.0)
+            cands = [(m, self.d1.get(m, 0.0)) for m in mem]
+            for m in mem:      # pair partners can hedge too, unless that pushes their own exposure the wrong way
+                for p, rho in self.partners.get(m, []):
+                    xp = self.eff.get(self.root[p], 0.0)
+                    if xp * x >= 0 or abs(xp) < 0.5 * trigger:
+                        cands.append((p, self.pair_weight(m, p, rho) * self.d1.get(p, 0.0)))
+            for m, dl in cands:
                 if self.kind[m] == "option" or m not in self.tobs or m not in self.fair or dl <= 1e-9:
                     continue
                 bid, bv, ask, av = self.tobs[m]
@@ -772,14 +973,39 @@ class AdaptiveBot:
 
     def take_mispriced(self, positions, deltas):
         traded = False
+        now = time.time()
         for iid, inst in self.instruments.items():
-            if iid not in self.tobs or iid not in self.fair or not self.brain.model_trusted(iid):
+            if (iid not in self.tobs or iid not in self.fair or not self.brain.model_trusted(iid)
+                    or self.guarded(iid, now)):
+                continue
+            f, tick = self.fair[iid], inst.tick_size
+            walls = self.walls.get(iid)
+            if walls:
+                # hit other teams' quotes that sit on the wrong side of our inventory-adjusted fair
+                # (incl. the follower's wall when the lead-lag says it's about to move)
+                if now - self.last_take[iid] < C.TAKE_COOLDOWN_S:
+                    continue
+                r = f - self.skew_ticks(iid, positions) * tick
+                need = (C.TAKE_EDGE_NARROW_TICKS if walls[2] else C.TAKE_EDGE_WIDE_TICKS) * tick
+                big = C.TAKE_SIZE_BIG if abs(self.debt.get(iid, 0.0)) >= C.LL_BIG_TICKS else C.MAX_TAKE_VOLUME
+                tb, ta = self.competitor_top(iid, "bid"), self.competitor_top(iid, "ask")
+                if tb and tb[0] - r >= need - 1e-9:
+                    vol = min(tb[1], big, self.room(iid, "ask", positions, deltas))
+                    if vol > 0:
+                        print(f"TAKE: sell {vol} {iid}@{tb[0]} (fair {f:.3f}, adj {r:.3f})")
+                        self.last_take[iid] = now
+                        traded |= self.ioc(iid, "ask", tb[0], vol) > 0
+                elif ta and r - ta[0] >= need - 1e-9:
+                    vol = min(ta[1], big, self.room(iid, "bid", positions, deltas))
+                    if vol > 0:
+                        print(f"TAKE: buy {vol} {iid}@{ta[0]} (fair {f:.3f}, adj {r:.3f})")
+                        self.last_take[iid] = now
+                        traded |= self.ioc(iid, "bid", ta[0], vol) > 0
                 continue
             bid, bv, ask, av = self.tobs[iid]
-            f, tick = self.fair[iid], inst.tick_size
             thresh = max(C.TAKE_MIN_TICKS * tick, C.TAKE_VOL_MULT * self.brain.sigma_1s(iid))
-            if not self.brain.vol_learned(iid):
-                thresh = max(thresh, ask - bid)        # cold start: only obvious mispricings
+            # little vol evidence yet: only obvious mispricings (fades with confidence)
+            thresh = max(thresh, (1 - self.brain.vol_conf(iid)) * (ask - bid))
             if ask <= f - thresh:
                 vol = min(av, C.MAX_TAKE_VOLUME, self.room(iid, "bid", positions, deltas))
                 if vol > 0:
@@ -790,6 +1016,28 @@ class AdaptiveBot:
                 if vol > 0:
                     print(f"TAKE: sell {vol} {iid}@{bid} (fair {f:.3f})")
                     traded |= self.ioc(iid, "ask", bid, vol) > 0
+        return traded
+
+    def hard_cap_cut(self, positions, now):
+        """|position| >= HARD_CAP: bounded IOC down to half the soft cap (at most CUT_SLIP_TICKS
+        through the wall). Waits 1 s between cuts so the position can update."""
+        traded = False
+        for iid in self.instruments:
+            pos = positions.get(iid, 0)
+            walls = self.walls.get(iid)
+            if abs(pos) < C.HARD_CAP or not walls:
+                continue
+            t0, p0 = self.last_cut.get(iid, (0.0, None))
+            if p0 == pos and now - t0 < 1.0:
+                continue
+            tick = self.instruments[iid].tick_size
+            vol = abs(pos) - self.cap(iid) // 2
+            side = "ask" if pos > 0 else "bid"
+            price = (round_down(walls[0] - C.CUT_SLIP_TICKS * tick, tick) if pos > 0
+                     else round_up(walls[1] + C.CUT_SLIP_TICKS * tick, tick))
+            print(f"HARD CAP {iid}: position {pos} -> {side} {vol} up to {price}")
+            self.last_cut[iid] = (now, pos)
+            traded |= self.ioc(iid, side, price, vol) > 0
         return traded
 
     def hedge(self, positions, deltas):
@@ -814,33 +1062,106 @@ class AdaptiveBot:
                 traded |= self.ioc(h, side, price, vol) > 0
         return traded
 
-    def target_quotes(self, iid, positions, deltas):
+    def _others(self, iid, side):
+        """[(price, volume)] on `side` with our own resting volume removed, best first."""
+        book = self.books.get(iid)
+        if not book:
+            return []
+        mine = defaultdict(int)
+        for o in self.open_orders.get(iid, {}).values():
+            if o.side == side:
+                mine[round(o.price, 6)] += int(o.volume)
+        out = []
+        for lv in (book.bids if side == "bid" else book.asks):
+            v = lv.volume - mine.get(round(lv.price, 6), 0)
+            if v > 0:
+                out.append((lv.price, v))
+        return out
+
+    def competitor_best(self, iid, side):
+        """Best competing price with real size: a level only counts once >= COMP_VOL lots rest at
+        or better than it, so a 1-lot decoy can't bait us into giving up edge."""
+        cum = 0
+        for price, v in self._others(iid, side):
+            cum += v
+            if cum >= C.COMP_VOL:
+                return price
+        return None
+
+    def competitor_top(self, iid, side):
+        """(price, volume) of the best level that isn't ours, or None."""
+        lv = self._others(iid, side)
+        return lv[0] if lv else None
+
+    def skew_ticks(self, iid, positions):
+        """Inventory lean in ticks (positive = we're long -> lower our prices): own position plus
+        net exposure of its root (pairs / ETF netting), each on a linear + cubic curve."""
+        cap = self.cap(iid)
+        pos = positions.get(iid, 0)
+        exposure = self.eff.get(self.root[iid], 0.0)
+        dl = clip(self.d1.get(iid, 1.0), -1.0, 1.0)
+        root_cap = cap if iid in self.narrow else C.MAX_ROOT_DELTA
+        return (C.SKEW_OWN * self._curve(pos / cap)
+                + C.SKEW_ROOT * self._curve(exposure / root_cap) * dl)
+
+    def target_quotes(self, iid, positions, deltas, now=None):
+        now = time.time() if now is None else now
         inst = self.instruments[iid]
         tick = inst.tick_size
         best_bid, _, best_ask, _ = self.tobs[iid]
         f = self.fair[iid]
-
-        edge = max(C.EDGE_MIN_TICKS * tick, C.EDGE_VOL_MULT * self.brain.sigma_1s(iid))
-        if not self.brain.vol_learned(iid):
-            edge = max(edge, C.COLD_SPREAD_FRAC * (best_ask - best_bid) / 2)
-        edge *= self.epoch[iid]["arm"] if iid in self.epoch else 1.0
-        e_bid = max(C.EDGE_MIN_TICKS * tick, edge + self.brain.adverse_extra_ticks(iid, "bid") * tick)
-        e_ask = max(C.EDGE_MIN_TICKS * tick, edge + self.brain.adverse_extra_ticks(iid, "ask") * tick)
-
-        pos = positions.get(iid, 0)
-        exposure = self.eff.get(self.root[iid], 0.0)
-        dl = clip(self.d1.get(iid, 1.0), -1.0, 1.0)
-        unit = max(tick, edge)
-        skew = -unit * (C.SKEW_OWN * self._curve(pos / C.MAX_POS)
-                        + C.SKEW_ROOT * self._curve(exposure / C.MAX_ROOT_DELTA) * dl)
-
-        bid = min(round_down(f - e_bid + skew, tick), round_down(best_ask - tick, tick))
-        ask = max(round_up(f + e_ask + skew, tick), round_up(best_bid + tick, tick))
-        if bid >= ask:
+        size = (C.OPTION_QUOTE_VOLUME if self.kind[iid] == "option"
+                else C.QUOTE_SIZES.get(iid, C.QUOTE_VOLUME))
+        if size <= 0:
             return None
-        size = C.OPTION_QUOTE_VOLUME if self.kind[iid] == "option" else C.QUOTE_VOLUME
+        walls = self.walls.get(iid)
+
+        if walls:
+            # ---- stocks with walls: teammate-style. Edge measured from the inventory-adjusted fair
+            # (reservation); penny the best competitor with real size; stay between the walls.
+            wb, wa, narrow = walls
+            edge = (C.MIN_EDGE_NARROW_TICKS if narrow else C.MIN_EDGE_WIDE_TICKS) * tick
+            edge *= self.epoch[iid]["arm"] if iid in self.epoch else 1.0
+            e_bid = max(0.0, edge + self.brain.adverse_extra_ticks(iid, "bid") * tick)
+            e_ask = max(0.0, edge + self.brain.adverse_extra_ticks(iid, "ask") * tick)
+            r = f - self.skew_ticks(iid, positions) * tick
+            bid = round_down(r - e_bid, tick)
+            ask = round_up(r + e_ask, tick)
+            no_bid, no_ask = bid < wb - 1e-9, ask > wa + 1e-9      # would be behind the wall: don't quote
+            if C.QUOTE_INSIDE:
+                cb, ca = self.competitor_best(iid, "bid"), self.competitor_best(iid, "ask")
+                bid = min(bid, round_down((cb if cb is not None else wb) + tick, tick))
+                ask = max(ask, round_up((ca if ca is not None else wa) - tick, tick))
+            ask = max(min(ask, wa), round_up(wb + tick, tick))
+            bid = min(max(bid, wb), round_down(wa - tick, tick))
+            if bid >= ask:
+                bid = round_down(ask - tick, tick)
+        else:
+            # ---- no walls (other instrument types): volatility-based edge around fair
+            no_bid = no_ask = False
+            edge = max(C.EDGE_MIN_TICKS * tick, C.EDGE_VOL_MULT * self.brain.sigma_1s(iid))
+            edge = max(edge, (1 - self.brain.vol_conf(iid)) * C.COLD_SPREAD_FRAC * (best_ask - best_bid) / 2)
+            edge *= self.epoch[iid]["arm"] if iid in self.epoch else 1.0
+            e_bid = max(C.EDGE_MIN_TICKS * tick, edge + self.brain.adverse_extra_ticks(iid, "bid") * tick)
+            e_ask = max(C.EDGE_MIN_TICKS * tick, edge + self.brain.adverse_extra_ticks(iid, "ask") * tick)
+            skew = -max(tick, edge) * self.skew_ticks(iid, positions)
+            bid = round_down(f - e_bid + skew, tick)
+            ask = round_up(f + e_ask + skew, tick)
+            bid = min(bid, round_down(best_ask - tick, tick))
+            ask = max(ask, round_up(best_bid + tick, tick))
+            if bid >= ask:
+                return None
+
         vb = min(size, self.room(iid, "bid", positions, deltas, include_open=False))
         va = min(size, self.room(iid, "ask", positions, deltas, include_open=False))
+        if no_bid or now < self.cooldown_until.get((iid, "bid"), 0.0):   # just filled: don't refill yet
+            vb = 0
+        if no_ask or now < self.cooldown_until.get((iid, "ask"), 0.0):
+            va = 0
+        if vb < C.MIN_QUOTE_SIZE:
+            vb = 0
+        if va < C.MIN_QUOTE_SIZE:
+            va = 0
         pl = getattr(inst, "price_limit", None)
         if bid < tick or (pl and bid < pl.min):
             vb = 0
@@ -857,11 +1178,17 @@ class AdaptiveBot:
             safe = (price - tol <= o.price <= price + 1e-9) if side == "bid" else (price - 1e-9 <= o.price <= price + tol)
             if safe and volume / 2 <= o.volume <= volume:
                 return
+            # less aggressive than wanted (never more): keep it until MIN_REQUOTE_S old
+            calmer = o.price <= price + 1e-9 if side == "bid" else o.price >= price - 1e-9
+            age = time.time() - self.order_t.get((iid, side), 0.0)
+            if calmer and o.volume <= volume and age < C.MIN_REQUOTE_S:
+                return
         # reserve the whole replace up front: never delete without being able to re-insert
         if not self.rl.take(len(mine) + (1 if volume > 0 else 0)):
             self.throttled += 1
             return
         for o in mine:
+            self.rl.pace()
             resp = self.ex.delete_order(iid, order_id=o.order_id)
             if resp is not None and not getattr(resp, "success", True):
                 self.warn(f"del-{iid}-{side}", f"[{iid}] delete {side} {o.order_id} failed: "
@@ -870,10 +1197,14 @@ class AdaptiveBot:
         if mine and any(o.side == side for o in self.ex.get_outstanding_orders(iid).values()):
             # Old order still live (failed or racing cancel): never stack a second one.
             return
+        self.order_t.pop((iid, side), None)
         if volume > 0:
+            self.rl.pace()
             resp = self.ex.insert_order(iid, price=price, volume=int(volume), side=side, order_type="limit")
             if not resp.success:
                 self.warn(f"lim-{iid}-{side}", f"[{iid}] {side} {volume}@{price} rejected: {resp.error_reason}")
+            else:
+                self.order_t[(iid, side)] = time.time()
 
     def quote(self, positions, deltas, paused):
         # rotate the starting instrument so a tight request budget is shared fairly
@@ -885,11 +1216,18 @@ class AdaptiveBot:
                 if outstanding is None:
                     outstanding = self.ex.get_outstanding_orders(iid)
                 q = None
-                if not paused and iid in self.tobs and iid in self.fair:
-                    q = self.target_quotes(iid, positions, deltas)
-                if q is None:
+                now = time.time()
+                blackout = self.in_blackout(iid, now)
+                if not paused and not blackout and not self.guarded(iid, now) and iid in self.tobs and iid in self.fair:
+                    q = self.target_quotes(iid, positions, deltas, now)
+                if q is None or (q[1] == 0 and q[3] == 0):
                     if outstanding and self.rl.take():
+                        if blackout:
+                            self.blackouts += 1
+                        self.rl.pace()
                         self.ex.delete_orders(iid)
+                        self.order_t.pop((iid, "bid"), None)
+                        self.order_t.pop((iid, "ask"), None)
                     continue
                 bid, vb, ask, va = q
                 self.sync_side(iid, "bid", bid, vb, outstanding)
@@ -914,7 +1252,8 @@ class AdaptiveBot:
         actions = [lambda: self.arbitrage(positions), lambda: self.basket_arb(positions)]
         if not paused:
             actions.append(lambda: self.take_mispriced(positions, deltas))
-        actions += [lambda: self.hedge(positions, deltas), lambda: self.unwind(positions, deltas, now)]
+        actions += [lambda: self.hedge(positions, deltas), lambda: self.unwind(positions, deltas, now),
+                    lambda: self.hard_cap_cut(positions, now)]
         for act in actions:
             if act():                                   # traded: refresh before the next decision
                 positions = self.ex.get_positions()
@@ -956,8 +1295,15 @@ class AdaptiveBot:
               f"{fmt(self.mk_cash)} cash, win-rate {fmt(wr, '.0f')}%")
         print(f"Request budget {C.MAX_REQUESTS_PER_S}/s | skipped for budget: {self.throttled}")
         print(f"Positions {positions} | net exposure per root (ETF vs stocks netted) {deltas}")
-        scored = sum(1 for n in b.s["names"].values() if n["n"] >= C.TIER2_NAME_TRADES)
-        alpha = ", ".join(f"{k}:{'ON' if b.alpha_active(k) else 'off'}({r['n']})" for k, r in b.s["reg"].items())
+        scored = sum(1 for n in b.s["names"].values() if n["n"] >= C.CONF_HALF_NAMES)
+        alpha = ", ".join(f"{k}:{100 * b.alpha_scale(k):.0f}% (live {r.get('n_live', 0)}, hist {r.get('n_hist', 0)})"
+                          for k, r in b.s["reg"].items())
+        now = time.time()
+        guarded = [i for i in self.instruments if self.guarded(i, now)]
+        print(f"Jumps detected: {self.jumps} | quotes pulled now: {guarded or '-'} | clock pulls {self.blackouts}")
+        ph = {i: f"{1000 * v:.0f}ms" for i, v in self.phase.items()}
+        debts = {i: round(d, 1) for i, d in self.debt.items() if abs(d) >= 0.05}
+        print(f"Clock phases: {ph or 'learning'} | lead-lag owed (ticks): {debts or '-'}")
         nw = b.s["news"]
         print(f"Learned: counterparties scored {scored}/{len(b.s['names'])} | news pause "
               f"{b.news_pause():.0f}s ({nw['n']} posts) | alpha {alpha or 'n/a'}")
@@ -965,7 +1311,10 @@ class AdaptiveBot:
             st = b.inst(iid)
             arm = self.epoch.get(iid, {}).get("arm", 1.0)
             extra = f" iv={st['iv']:.3f}" if st["iv"] else ""
-            print(f"  {iid:<14} T{b.tier(iid)} vol1s={b.sigma_1s(iid):.4f} basis={b.basis(iid):+.4f} "
+            w = self.walls.get(iid)
+            tick = self.instruments[iid].tick_size
+            wall = f"wall={(w[1] - w[0]) / tick:.0f}t" if w else "wall=-"
+            print(f"  {iid:<14} T{b.tier(iid)} {wall} vol1s={b.sigma_1s(iid):.4f} (conf {100 * b.vol_conf(iid):.0f}%) "
                   f"trust={'Y' if b.model_trusted(iid) else 'N'} fills={st['fills']} "
                   f"mkB={fmt(st['mk_bid'])} mkA={fmt(st['mk_ask'])} arm={arm}{extra}")
         return self.session
@@ -1021,6 +1370,7 @@ class AdaptiveBot:
                 try:
                     while not self.rl.take():
                         time.sleep(0.05)
+                    self.rl.pace()
                     self.ex.delete_orders(iid)
                 except Exception as e:
                     print(f"[{iid}] delete_orders failed: {e}")

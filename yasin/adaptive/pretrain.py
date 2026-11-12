@@ -1,17 +1,15 @@
 """
-Pre-train the brain from historical data (the "context").
+Pre-train the brain from historical data (the "context") -- as a PRIOR, not as live data.
 
-Replays raw_pricebooks.csv.gz + raw_trades.csv.gz through the bot's own market-data,
-fair-value and learning code, with trading switched off. That way the features it
-learns from are computed exactly as they are live. No exchange connection, no orders.
-
-Learns:   volatility per instrument, book counts (tier 1), the short-term prediction
-          model (imbalance / trade flow), basis.
-Can't:    own fills, markouts, bandit (needs live fills); counterparty scores
-          (names are blank in the data); news (not in the data).
-
-Each history file is replayed only once (remembered in brain.json).
-Vol already learned live is kept: older history doesn't overwrite fresher estimates.
+Replays raw_pricebooks.csv.gz + raw_trades.csv.gz (full depth, so the exchange walls
+are visible) through the bot's own market-data / fair-value / learning code into a
+THROWAWAY brain, then hands the real brain only:
+  - per-stock volatility as a prior (worth HIST_PRIOR_VOL_SAMPLES live samples, and it
+    drops out by itself when live volatility disagrees), and
+  - prediction-model samples at HIST_SAMPLE_WEIGHT each. Whether that model may act is
+    decided by its accuracy on LIVE data only.
+Nothing here counts as live evidence: no tier opens because of history.
+No exchange connection, no orders. Each history file is used once (remembered in brain.json).
 
     python pretrain.py            # replay history the brain hasn't seen
     python pretrain.py --force    # replay again anyway
@@ -49,21 +47,19 @@ def _signature(path):
 
 
 def load_history(folder):
-    """Top of book per snapshot and trades, both sorted by time (seconds)."""
+    """Full-depth book snapshots (t, iid, bids, asks) with levels as (price, volume),
+    and trades, both sorted by time (seconds)."""
     books = []
     with gzip.open(os.path.join(folder, BOOKS), "rt", newline="") as fh:
         for row in csv.DictReader(fh):
             try:
-                bids, asks = json.loads(row["bids_json"]), json.loads(row["asks_json"])
-            except (ValueError, KeyError):
+                bids = [(float(p), int(v)) for p, v in json.loads(row["bids_json"])]
+                asks = [(float(p), int(v)) for p, v in json.loads(row["asks_json"])]
+            except (ValueError, KeyError, TypeError):
                 continue
-            if not bids or not asks:
+            if not bids or not asks or asks[0][0] <= bids[0][0]:
                 continue
-            bid, bv = float(bids[0][0]), int(bids[0][1])
-            ask, av = float(asks[0][0]), int(asks[0][1])
-            if ask <= bid:
-                continue
-            books.append((int(row["timestamp_ns"]) / 1e9, row["instrument_id"], bid, bv, ask, av))
+            books.append((int(row["timestamp_ns"]) / 1e9, row["instrument_id"], bids, asks))
     trades = []
     with gzip.open(os.path.join(folder, TRADES), "rt", newline="") as fh:
         for row in csv.DictReader(fh):
@@ -108,8 +104,9 @@ class ReplayExchange:
 
     def advance_to(self, t):
         while self.bi < len(self.books) and self.books[self.bi][0] <= t:
-            _, iid, b, bv, a, av = self.books[self.bi]
-            self.latest[iid] = NS(bids=[NS(price=b, volume=bv)], asks=[NS(price=a, volume=av)])
+            _, iid, bids, asks = self.books[self.bi]
+            self.latest[iid] = NS(bids=[NS(price=p, volume=v) for p, v in bids],
+                                  asks=[NS(price=p, volume=v) for p, v in asks])
             self.bi += 1
         while self.ti < len(self.trades) and self.trades[self.ti][0] <= t:
             _, iid, p, v, side, buyer, seller = self.trades[self.ti]
@@ -148,14 +145,11 @@ def pretrain(data_dir=C.DATA_DIR, history_dir=None, force=False, verbose=True):
         say("Pretrain: no usable book snapshots; skipping.")
         return False
     prices = defaultdict(list)
-    for _, iid, b, _, a, _ in books:
-        prices[iid] += (b, a)
+    for _, iid, bids, asks in books:
+        prices[iid] += (bids[0][0], asks[0][0])
     ticks = {iid: (C.HISTORY_TICK or infer_tick(p)) for iid, p in prices.items()}
     say(f"Pretrain: {len(books)} books, {len(trades)} trades, "
         f"{(books[-1][0] - books[0][0]) / 60:.1f} min, ticks {ticks}")
-
-    # vol learned live is fresher than history: remember it and put it back afterwards
-    keep_vol = {iid: brain.inst(iid)["sigma2"] for iid in ticks if brain.vol_learned(iid)}
 
     ex = ReplayExchange(books, trades, ticks)
     clock = [books[0][0]]
@@ -163,13 +157,14 @@ def pretrain(data_dir=C.DATA_DIR, history_dir=None, force=False, verbose=True):
     B.time = NS(time=lambda: clock[0], strftime=_time.strftime, localtime=_time.localtime,
                 sleep=lambda s: None)
     B.print = lambda *a, **k: None
-    tmp = tempfile.mkdtemp(prefix="pretrain_logs_")
+    tmp = tempfile.mkdtemp(prefix="pretrain_")
+    wall_seen, wall_spread = defaultdict(int), defaultdict(list)
     try:
-        bot = B.AdaptiveBot(ex, data_dir=tmp)      # throwaway logs / session counter
-        bot.brain = brain                          # learn into the real brain
+        bot = B.AdaptiveBot(ex, data_dir=tmp)      # throwaway brain, logs and session counter
         bot._bandit_epochs = lambda now: None      # no fills in history: don't score arms
         prev = None
         end = books[-1][0]
+        n_steps = 0
         while clock[0] <= end:
             ex.advance_to(clock[0])
             now = clock[0]
@@ -178,30 +173,53 @@ def pretrain(data_dir=C.DATA_DIR, history_dir=None, force=False, verbose=True):
             bot.read_market(now, dt)
             bot.compute_fairs()
             bot.learn(now, dt)
+            n_steps += 1
+            for iid, w in bot.walls.items():
+                if w:
+                    wall_seen[iid] += 1
+                    wall_spread[iid].append(round((w[1] - w[0]) / ticks[iid]))
             clock[0] += C.LOOP_SLEEP
         bot.log.close()
+        hist = bot.brain
     finally:
         B.time = real_time
         del B.print                                # back to the builtin print
         shutil.rmtree(tmp, ignore_errors=True)
 
-    for iid, s2 in keep_vol.items():
-        brain.inst(iid)["sigma2"] = s2
-    for s in sigs:
-        if s not in done:
-            done.append(s)
+    # hand over: volatility as a prior, model samples down-weighted. Live counts untouched.
+    for iid in ticks:
+        h = hist.inst(iid)
+        if h["sigma2"]:
+            brain.set_hist_vol(iid, h["sigma2"], h["n_vol"])
+    for k, hr in hist.s["reg"].items():
+        r = brain._reg(k)
+        wgt = C.HIST_SAMPLE_WEIGHT
+        for i in range(len(r["Xty"])):
+            r["Xty"][i] += wgt * hr["Xty"][i]
+            for j in range(len(r["Xty"])):
+                r["XtX"][i][j] += wgt * hr["XtX"][i][j]
+        r["n_hist"] += hr["n_live"]
+        r["n"] += hr["n"]
+        brain._w_cache.pop(k, None)
+    for sig in sigs:
+        if sig not in done:
+            done.append(sig)
     brain.save()
 
     say(f"Pretrain: done in {_time.time() - t0:.0f}s -> {brain.path}")
     for iid in sorted(ticks):
-        st = brain.inst(iid)
-        say(f"  {iid:<8} tier T{brain.tier(iid)} vol1s={brain.sigma_1s(iid):.4f} "
-            f"books={st['n_books']} vol_samples={st['n_vol']}")
-    for k, r in brain.s["reg"].items():
-        w = [round(x, 3) for x in brain._weights(k)]
-        ratio = r["mse_model"] / r["mse_zero"] if r["mse_zero"] else float("nan")
-        say(f"  prediction model {k}: {r['n']} samples, weights {dict(zip(FEATURE_NAMES, w))}, "
-            f"error vs 'no move' {ratio:.3f} -> {'ON' if brain.alpha_active(k) else 'off'}")
+        sp = sorted(wall_spread[iid])
+        med = sp[len(sp) // 2] if sp else None
+        say(f"  {iid:<8} history vol1s={math.sqrt(brain.inst(iid)['sigma2_hist'] or 0):.4f} "
+            f"(prior worth {C.HIST_PRIOR_VOL_SAMPLES} live samples) | walls seen "
+            f"{100 * wall_seen[iid] / max(1, n_steps):.0f}% of the time, median wall spread {med} ticks")
+    for k, hr in hist.s["reg"].items():
+        w = [round(x, 3) for x in hist._weights(k)]
+        ratio = hr["mse_model"] / hr["mse_zero"] if hr["mse_zero"] else float("nan")
+        say(f"  prediction model {k}: {hr['n_live']} history samples (weight {C.HIST_SAMPLE_WEIGHT}), "
+            f"history-only error vs 'no move' {ratio:.3f}; acts only once live data proves it "
+            f"(now {100 * brain.alpha_scale(k):.0f}%)")
+        say(f"    weights {dict(zip(FEATURE_NAMES, w))}")
     return True
 
 
