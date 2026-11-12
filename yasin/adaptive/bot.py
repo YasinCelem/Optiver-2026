@@ -41,7 +41,7 @@ import os
 import random
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -111,9 +111,33 @@ class Throttle:
             print(msg)
 
 
+class RateLimiter:
+    """Sliding 1-second window on order requests (insert/delete). Exceeding the
+    exchange's limit gets the whole team force-disconnected."""
+
+    def __init__(self, per_s):
+        self.per_s = per_s
+        self.ts = deque()
+
+    def available(self):
+        now = time.time()
+        while self.ts and now - self.ts[0] >= 1.0:
+            self.ts.popleft()
+        return self.per_s - len(self.ts)
+
+    def take(self, n=1):
+        if self.available() < n:
+            return False
+        self.ts.extend([time.time()] * n)
+        return True
+
+
 class AdaptiveBot:
     def __init__(self, exchange, data_dir=C.DATA_DIR):
         self.ex = exchange
+        self.rl = RateLimiter(C.MAX_REQUESTS_PER_S)
+        self.throttled = 0
+        self.quote_offset = 0
         self.brain = Brain(data_dir)
         self.brain.s["sessions"] += 1
         self.log = DataLog(data_dir)
@@ -131,8 +155,10 @@ class AdaptiveBot:
 
         # live state (not persisted)
         self.tobs, self.mid, self.fair, self.fair_pre, self.theo = {}, {}, {}, {}, {}
-        self.affine, self.d1, self.U = {}, {}, {}
-        self.prev_fair, self.prev_t = {}, None
+        self.affine, self.d1, self.U, self.eff = {}, {}, {}, {}
+        self.vol_anchor, self.prev_t = {}, None
+        self.last_unwind = defaultdict(float)
+        self.basket = self._basket_units()
         self.flow, self.iflow = defaultdict(float), defaultdict(float)
         self.features = {}
         self.ioc_ids = set()
@@ -193,6 +219,27 @@ class AdaptiveBot:
             else:
                 print(f"[{iid}] index constituents not all tradable; using books for its value")
         return defs
+
+    def _basket_units(self):
+        """For each ETF/future on an index we know: the smallest whole-lot trade
+        (n0 lots of it vs integer lots of each constituent) that is fully hedged."""
+        out = {}
+        for root, (comp, divisor) in self.index_def.items():
+            for m in self.members[root]:
+                if self.kind[m] == "option":
+                    continue
+                a, _ = self._affine(m)
+                h = {c: a * w / divisor for c, w in comp.items()}
+                for n0 in range(1, 51):
+                    if all(abs(n0 * x - round(n0 * x)) <= 0.05 for x in h.values()):
+                        q = {c: int(round(n0 * x)) for c, x in h.items() if round(n0 * x) > 0}
+                        if q:
+                            out[m] = (n0, q)
+                            print(f"Basket for {m}: {n0} lots <-> {q}")
+                        break
+                else:
+                    print(f"[{m}] no small whole-lot basket; basket arb off for it (hedging still works)")
+        return out
 
     def _affine(self, iid, depth=0):
         """fair(iid) = a * U(root) + b for delta-one instruments."""
@@ -422,11 +469,16 @@ class AdaptiveBot:
 
     # ================================================================== learning
     def learn(self, now, dt):
+        # vol from moves over VOL_SAMPLE_S, not per loop: a microprice that flickers
+        # between ticks adds noise^2/dt, which is 20x smaller at 5s than at 0.25s.
         for iid, f in self.fair_pre.items():
-            p = self.prev_fair.get(iid)
-            if p is not None:
-                self.brain.update_vol(iid, f - p, dt)
-            self.prev_fair[iid] = f
+            self.brain.count_book(iid)
+            anchor = self.vol_anchor.get(iid)
+            if anchor is None:
+                self.vol_anchor[iid] = (now, f)
+            elif now - anchor[0] >= C.VOL_SAMPLE_S:
+                self.brain.update_vol(iid, f - anchor[1], now - anchor[0])
+                self.vol_anchor[iid] = (now, f)
 
         # sample features now, label them ALPHA_HORIZON_S later
         for iid, x in self.features.items():
@@ -532,6 +584,31 @@ class AdaptiveBot:
             d[self.root[iid]] += positions.get(iid, 0) * dl
         return d
 
+    def refresh_risk(self, positions):
+        """Raw delta per root (used for hard limits) and effective exposure
+        (used for skew / unwinding / hedging), where an ETF position and its
+        constituent stocks offset each other."""
+        raw = self.root_deltas(positions)
+        eff = defaultdict(float, raw)
+        for R, (comp, divisor) in self.index_def.items():
+            ref_a = self._ref_a(R)
+            pos_u = raw.get(R, 0.0) * ref_a                  # exposure in index units
+            num = den = 0.0
+            for c, w in comp.items():
+                h = w / divisor
+                eff[self.root[c]] += pos_u * h               # stock lots the index position represents
+                num += raw.get(self.root[c], 0.0) * h
+                den += h * h
+            if den > 0:
+                eff[R] += (num / den) / ref_a                # index units the stocks represent
+        self.eff = eff
+        return raw
+
+    @staticmethod
+    def _curve(u):
+        u = clip(u, -1.5, 1.5)
+        return u + C.SKEW_CONVEXITY * u ** 3
+
     def open_vol(self, iid, side):
         """Volume of our resting orders on this side (they can still fill)."""
         return sum(int(o.volume) for o in self.open_orders.get(iid, {}).values() if o.side == side)
@@ -559,6 +636,9 @@ class AdaptiveBot:
     def ioc(self, iid, side, price, volume, wait=False):
         volume = int(volume)
         if volume <= 0:
+            return 0
+        if not self.rl.take():
+            self.throttled += 1
             return 0
         resp = self.ex.insert_order(iid, price=price, volume=volume, side=side, order_type="ioc")
         if not resp.success:
@@ -595,20 +675,99 @@ class AdaptiveBot:
                     _, _, ask_b, av_b = self.tobs[b]
                     profit = ((bid_a - ba) / aa - (ask_b - bb) / ab) * aa   # per lot of a
                     tick = max(self.instruments[a].tick_size, self.instruments[b].tick_size)
-                    if profit < C.ARB_MIN_TICKS * tick - 1e-9:
-                        continue
                     pa, pb = positions.get(a, 0), positions.get(b, 0)
+                    # Offsetting legs near their limits (long a, short b) block quoting on
+                    # both; flattening them is worth paying a little for.
+                    rebalance = (pa > 0 > pb and max(pa, -pb) > C.UNWIND_TRIGGER_FRAC * C.MAX_POS)
+                    min_profit = -C.REBALANCE_COST_TICKS * tick if rebalance else C.ARB_MIN_TICKS * tick
+                    if profit < min_profit - 1e-9:
+                        continue
                     sell_a = min(C.MAX_POS + pa, C.POSITION_LIMIT + pa) - self.open_vol(a, "ask")
                     buy_b = min(C.MAX_POS - pb, C.POSITION_LIMIT - pb) - self.open_vol(b, "bid")
                     vol_a = min(bv_a, int(av_b / ratio), C.MAX_TAKE_VOLUME, sell_a, int(buy_b / ratio))
+                    if profit < C.ARB_MIN_TICKS * tick - 1e-9:          # pure rebalance: don't overshoot
+                        vol_a = min(vol_a, C.UNWIND_CHUNK, pa, int(-pb / ratio))
                     vol_b = int(round(vol_a * ratio))
                     if vol_a < 1 or vol_b < 1:
                         continue
-                    print(f"ARB {root}: buy {vol_b} {b}@{ask_b}, sell {vol_a} {a}@{bid_a} (+{profit * vol_a:.2f})")
+                    tag = "ARB" if profit >= C.ARB_MIN_TICKS * tick - 1e-9 else "REBALANCE"
+                    print(f"{tag} {root}: buy {vol_b} {b}@{ask_b}, sell {vol_a} {a}@{bid_a} ({profit * vol_a:+.2f})")
                     filled_b = self.ioc(b, "bid", ask_b, vol_b, wait=True)
                     if filled_b > 0:
                         self.ioc(a, "ask", bid_a, min(vol_a, max(1, int(round(filled_b / ratio)))))
                     traded = done = True
+        return traded
+
+    def basket_arb(self, positions):
+        """ETF (or index future) vs its constituent stocks, top of book only."""
+        if not C.BASKET_ARB:
+            return False
+        traded = False
+        for m, (n0, q) in self.basket.items():
+            if m not in self.tobs or any(c not in self.tobs for c in q) or not self.brain.model_trusted(m):
+                continue
+            _, b = self.affine[m]
+            tick = self.instruments[m].tick_size
+            bid_m, bv_m, ask_m, av_m = self.tobs[m]
+            basket_ask = sum(n * self.tobs[c][2] for c, n in q.items())
+            basket_bid = sum(n * self.tobs[c][0] for c, n in q.items())
+            for side_m, price_m, avail_m, profit in (
+                    ("ask", bid_m, bv_m, n0 * (bid_m - b) - basket_ask),     # sell ETF, buy stocks
+                    ("bid", ask_m, av_m, basket_bid - n0 * (ask_m - b))):    # buy ETF, sell stocks
+                if profit < C.ARB_MIN_TICKS * tick * n0 - 1e-9:
+                    continue
+                side_c = "bid" if side_m == "ask" else "ask"
+                k = min(avail_m // n0, max(1, C.MAX_TAKE_VOLUME // n0),
+                        self.room(m, side_m, positions, {}, use_delta=False) // n0)
+                for c, n in q.items():
+                    lvl_vol = self.tobs[c][3] if side_c == "bid" else self.tobs[c][1]
+                    k = min(k, lvl_vol // n, self.room(c, side_c, positions, {}, use_delta=False) // n)
+                if k < 1:
+                    continue
+                print(f"BASKET: {'sell' if side_m == 'ask' else 'buy'} {k * n0} {m}@{price_m} vs "
+                      f"{ {c: k * n for c, n in q.items()} } (+{profit * k:.2f})")
+                filled = self.ioc(m, side_m, price_m, k * n0, wait=True)
+                if filled > 0:
+                    for c, n in q.items():
+                        qty = int(round(filled * n / n0))
+                        price_c = self.tobs[c][2] if side_c == "bid" else self.tobs[c][0]
+                        self.ioc(c, side_c, price_c, qty)
+                traded = True
+                break
+        return traded
+
+    def unwind(self, positions, deltas, now):
+        """Exposure near the limit: cross the spread in the cheapest linked instrument,
+        but only when that costs little. Roots with options use hedge() instead."""
+        traded = False
+        trigger = C.UNWIND_TRIGGER_FRAC * C.MAX_ROOT_DELTA
+        for root, mem in self.members.items():
+            if any(self.kind[m] == "option" for m in mem):
+                continue
+            x = self.eff.get(root, 0.0)
+            if abs(x) <= trigger or now - self.last_unwind[root] < C.UNWIND_COOLDOWN_S:
+                continue
+            side = "ask" if x > 0 else "bid"
+            best = None
+            for m in mem:
+                dl = self.d1.get(m, 0.0)
+                if self.kind[m] == "option" or m not in self.tobs or m not in self.fair or dl <= 1e-9:
+                    continue
+                bid, bv, ask, av = self.tobs[m]
+                tick = self.instruments[m].tick_size
+                price, avail = (bid, bv) if side == "ask" else (ask, av)
+                cost = (self.fair[m] - price) / tick if side == "ask" else (price - self.fair[m]) / tick
+                if cost > C.UNWIND_MAX_COST_TICKS:
+                    continue
+                vol = min(C.UNWIND_CHUNK, avail, self.room(m, side, positions, deltas, use_delta=False),
+                          math.ceil((abs(x) - trigger) / dl))
+                if vol > 0 and (best is None or cost / dl < best[0]):
+                    best = (cost / dl, m, price, vol, cost)
+            if best:
+                _, m, price, vol, cost = best
+                print(f"UNWIND {root}: exposure {x:+.1f} -> {side} {vol} {m}@{price} (cost {cost:.1f} ticks/lot)")
+                self.last_unwind[root] = now
+                traded |= self.ioc(m, side, price, vol) > 0
         return traded
 
     def take_mispriced(self, positions, deltas):
@@ -638,7 +797,7 @@ class AdaptiveBot:
         for root, mem in self.members.items():
             if not any(self.kind[m] == "option" for m in mem):
                 continue
-            delta = deltas.get(root, 0.0)
+            delta = self.eff.get(root, 0.0)
             if abs(delta) <= C.HEDGE_TRIGGER:
                 continue
             cands = [m for m in mem if self.kind[m] != "option" and m in self.tobs and abs(self.d1.get(m, 0)) > 1e-9]
@@ -669,9 +828,11 @@ class AdaptiveBot:
         e_ask = max(C.EDGE_MIN_TICKS * tick, edge + self.brain.adverse_extra_ticks(iid, "ask") * tick)
 
         pos = positions.get(iid, 0)
-        rd = deltas.get(self.root[iid], 0.0)
+        exposure = self.eff.get(self.root[iid], 0.0)
         dl = clip(self.d1.get(iid, 1.0), -1.0, 1.0)
-        skew = -tick * (C.SKEW_OWN_TICKS * pos / C.MAX_POS + C.SKEW_ROOT_TICKS * rd / C.MAX_ROOT_DELTA * dl)
+        unit = max(tick, edge)
+        skew = -unit * (C.SKEW_OWN * self._curve(pos / C.MAX_POS)
+                        + C.SKEW_ROOT * self._curve(exposure / C.MAX_ROOT_DELTA) * dl)
 
         bid = min(round_down(f - e_bid + skew, tick), round_down(best_ask - tick, tick))
         ask = max(round_up(f + e_ask + skew, tick), round_up(best_bid + tick, tick))
@@ -696,6 +857,10 @@ class AdaptiveBot:
             safe = (price - tol <= o.price <= price + 1e-9) if side == "bid" else (price - 1e-9 <= o.price <= price + tol)
             if safe and volume / 2 <= o.volume <= volume:
                 return
+        # reserve the whole replace up front: never delete without being able to re-insert
+        if not self.rl.take(len(mine) + (1 if volume > 0 else 0)):
+            self.throttled += 1
+            return
         for o in mine:
             resp = self.ex.delete_order(iid, order_id=o.order_id)
             if resp is not None and not getattr(resp, "success", True):
@@ -711,7 +876,10 @@ class AdaptiveBot:
                 self.warn(f"lim-{iid}-{side}", f"[{iid}] {side} {volume}@{price} rejected: {resp.error_reason}")
 
     def quote(self, positions, deltas, paused):
-        for iid in self.instruments:
+        # rotate the starting instrument so a tight request budget is shared fairly
+        ids = list(self.instruments)
+        self.quote_offset = (self.quote_offset + 1) % max(1, len(ids))
+        for iid in ids[self.quote_offset:] + ids[:self.quote_offset]:
             try:
                 outstanding = self.open_orders.get(iid)
                 if outstanding is None:
@@ -720,7 +888,7 @@ class AdaptiveBot:
                 if not paused and iid in self.tobs and iid in self.fair:
                     q = self.target_quotes(iid, positions, deltas)
                 if q is None:
-                    if outstanding:
+                    if outstanding and self.rl.take():
                         self.ex.delete_orders(iid)
                     continue
                 bid, vb, ask, va = q
@@ -742,19 +910,15 @@ class AdaptiveBot:
         paused = now < self.pause_until
         self.open_orders = {iid: self.ex.get_outstanding_orders(iid) for iid in self.instruments}
         positions = self.ex.get_positions()
-        deltas = self.root_deltas(positions)
-        traded = self.arbitrage(positions)
+        deltas = self.refresh_risk(positions)
+        actions = [lambda: self.arbitrage(positions), lambda: self.basket_arb(positions)]
         if not paused:
-            if traded:
+            actions.append(lambda: self.take_mispriced(positions, deltas))
+        actions += [lambda: self.hedge(positions, deltas), lambda: self.unwind(positions, deltas, now)]
+        for act in actions:
+            if act():                                   # traded: refresh before the next decision
                 positions = self.ex.get_positions()
-                deltas = self.root_deltas(positions)
-            traded |= self.take_mispriced(positions, deltas)
-        if traded:
-            positions = self.ex.get_positions()
-            deltas = self.root_deltas(positions)
-        if self.hedge(positions, deltas):
-            positions = self.ex.get_positions()
-            deltas = self.root_deltas(positions)
+                deltas = self.refresh_risk(positions)
         self.quote(positions, deltas, paused)
 
         for iid in self.instruments:
@@ -778,7 +942,8 @@ class AdaptiveBot:
         self.session = pnl - self.start_pnl if pnl is not None and self.start_pnl is not None else None
         el = time.time() - self.start_time
         positions = {k: v for k, v in self.ex.get_positions().items() if v}
-        deltas = {r: round(d, 1) for r, d in self.root_deltas(self.ex.get_positions()).items() if abs(d) > 0.05}
+        self.refresh_risk(self.ex.get_positions())
+        deltas = {r: round(d, 1) for r, d in self.eff.items() if abs(d) > 0.05}
         b = self.brain
         fmt = lambda x, s="+.2f": "n/a" if x is None else format(x, s)  # noqa: E731
 
@@ -789,7 +954,8 @@ class AdaptiveBot:
         wr = 100.0 * self.mk_wins / self.mk_lots if self.mk_lots else None
         print(f"Fills {self.lots} lots, notional {self.notional:,.0f} | {C.MARKOUT_S:.0f}s markout "
               f"{fmt(self.mk_cash)} cash, win-rate {fmt(wr, '.0f')}%")
-        print(f"Positions {positions} | delta per root {deltas}")
+        print(f"Request budget {C.MAX_REQUESTS_PER_S}/s | skipped for budget: {self.throttled}")
+        print(f"Positions {positions} | net exposure per root (ETF vs stocks netted) {deltas}")
         scored = sum(1 for n in b.s["names"].values() if n["n"] >= C.TIER2_NAME_TRADES)
         alpha = ", ".join(f"{k}:{'ON' if b.alpha_active(k) else 'off'}({r['n']})" for k, r in b.s["reg"].items())
         nw = b.s["news"]
@@ -853,6 +1019,8 @@ class AdaptiveBot:
         if self.ex.is_connected():
             for iid in self.instruments:
                 try:
+                    while not self.rl.take():
+                        time.sleep(0.05)
                     self.ex.delete_orders(iid)
                 except Exception as e:
                     print(f"[{iid}] delete_orders failed: {e}")
@@ -866,6 +1034,12 @@ class AdaptiveBot:
 
 
 def main():
+    if C.AUTO_PRETRAIN:
+        try:
+            from pretrain import pretrain
+            pretrain()
+        except Exception as e:                      # never block live trading on this
+            print(f"Pretrain failed ({e!r}); continuing without it.")
     from optibook.synchronous_client import Exchange
     exchange = Exchange()
     exchange.connect()

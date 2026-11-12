@@ -7,6 +7,15 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")          # brain.json + raw logs live here
 
+# Historical data (context). Linked, not copied: the first folder that exists is
+# used. Needs raw_pricebooks.csv.gz and raw_trades.csv.gz inside it.
+HISTORY_DIRS = [
+    os.path.join(HERE, "..", "..", "research_run_01"),        # Optibook workspace layout
+    os.path.join(HERE, "..", "..", "..", "research run"),     # local copy
+]
+AUTO_PRETRAIN = True        # on start, replay any history the brain hasn't seen yet
+HISTORY_TICK = None         # None = infer tick size per instrument from the prices
+
 # ---------------------------------------------------------------------------
 # Instruments
 # ---------------------------------------------------------------------------
@@ -30,7 +39,8 @@ UNWIND_MAX_COST_TICKS = 2.0 # ... but only if crossing costs at most this many t
 UNWIND_CHUNK = 5            # lots per unwind trade
 UNWIND_COOLDOWN_S = 2.0     # per root
 REBALANCE_COST_TICKS = 1.0  # pay up to this per lot to flatten offsetting legs (e.g. +60 A / -60 B)
-MAX_CONSECUTIVE_ERRORS = 5 # stop (and pull orders) after this many failed loops in a row
+MAX_REQUESTS_PER_S = 20     # order inserts+deletes per second; the exchange force-disconnects above its limit
+MAX_CONSECUTIVE_ERRORS = 5# stop (and pull orders) after this many failed loops in a row
 MAX_BOOK_AGE_S = 5.0        # ignore books older than this (None = off); auto-off if clocks disagree
 
 # ---------------------------------------------------------------------------
@@ -52,6 +62,7 @@ REQUOTE_TOL_TICKS = 1
 # Taking / arbitrage
 # ---------------------------------------------------------------------------
 ARB_MIN_TICKS = 1
+BASKET_ARB = True           # ETF vs its constituent stocks
 TAKE_MIN_TICKS = 3
 TAKE_VOL_MULT = 3.0
 MAX_TAKE_VOLUME = 10
@@ -72,6 +83,7 @@ MARKOUT_TARGET_TICKS = 0.5  # markout we want per fill; below -> widen, above ->
 ALPHA_HORIZON_S = 5.0
 ALPHA_SAMPLE_EVERY_S = 1.0
 RIDGE_LAMBDA = 20.0
+RIDGE_HALFLIFE_SAMPLES = 20000   # a sample this many samples old counts half (~40 min live with 8 stocks)
 ALPHA_WEIGHT = 0.5          # how much of the predicted move we put in fair value
 ALPHA_CLIP_TICKS = 3.0
 BANDIT_ARMS = [0.7, 1.0, 1.4, 2.0]   # multipliers on the quoting edge

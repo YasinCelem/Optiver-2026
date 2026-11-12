@@ -103,7 +103,7 @@ class FakeExchange:
                 self.news.append(NS(post=f"Big news about {k}!", meta_data=None))
         for iid in self.inst:
             v = self.value(iid)
-            if iid == "B" and self.rng.random() < 0.05:
+            if iid in ("B", "E") and self.rng.random() < 0.05:   # occasional mispricing -> arb
                 v += self.rng.choice([-1, 1]) * 0.5
             half = self.rng.choice([0.1, 0.2, 0.3])
             bid = round(math.floor((v - half) / TICK) * TICK, 6)
@@ -128,12 +128,13 @@ class FakeExchange:
             self.ticks[iid].append(NS(volume=self.rng.randint(1, 20), price=self.value(iid), aggressor_side=side,
                                       buyer=nm_name if side == "bid" else "noise4",
                                       seller=nm_name if side == "ask" else "noise4"))
-        # takers on our resting orders: informed (order is wrong vs true value) or noise
+        # takers on our resting orders: informed (order is wrong vs true value) or noise,
+        # where noise is much less likely to reach quotes far from the value
         for iid, ords in self.orders.items():
             v = self.value(iid)
             for oid, o in list(ords.items()):
                 informed = (o.side == "ask" and o.price < v) or (o.side == "bid" and o.price > v)
-                if informed or self.rng.random() < 0.15:
+                if informed or self.rng.random() < 0.35 * math.exp(-abs(o.price - v) / 0.25):
                     q = min(o.volume, self.rng.randint(1, 5))
                     self._fill(iid, o.side, o.price, q, oid)
                     o.volume -= q

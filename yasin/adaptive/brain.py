@@ -54,26 +54,35 @@ class Brain:
 
     # ------------------------------------------------------------------ per instrument
     def inst(self, iid):
-        return self.s["inst"].setdefault(iid, {
-            "n_books": 0, "sigma2": None, "basis": 0.0, "n_basis": 0, "rel_err": None,
+        st = self.s["inst"].setdefault(iid, {
+            "n_books": 0, "sigma2": None, "n_vol": 0, "vol_method": 2,
+            "basis": 0.0, "n_basis": 0, "rel_err": None,
             "iv": None, "n_iv": 0, "fills": 0, "passive_fills": 0,
             "mk_bid": None, "mk_ask": None, "n_bid": 0, "n_ask": 0,
         })
+        if st.get("vol_method") != 2:          # old per-loop estimate was inflated by book noise
+            st.update(sigma2=None, n_vol=0, vol_method=2)
+        return st
 
     def vol_learned(self, iid):
-        return self.inst(iid)["n_books"] >= C.TIER1_BOOKS
+        st = self.inst(iid)
+        return st["n_books"] >= C.TIER1_BOOKS and st["n_vol"] >= C.VOL_MIN_SAMPLES
 
     def sigma_1s(self, iid):
         s2 = self.inst(iid)["sigma2"]
         return math.sqrt(s2) if s2 else 0.0
 
+    def count_book(self, iid):
+        self.inst(iid)["n_books"] += 1
+
     def update_vol(self, iid, move, dt):
+        """move = fair-value change over dt seconds (dt ~ VOL_SAMPLE_S)."""
         if dt <= 0:
             return
         st = self.inst(iid)
         a = 1 - 0.5 ** (dt / C.VOL_HALFLIFE_S)
         st["sigma2"] = ema(st["sigma2"], move * move / dt, a)
-        st["n_books"] += 1
+        st["n_vol"] += 1
 
     def update_basis(self, iid, market_minus_model, rel_err):
         st = self.inst(iid)
@@ -184,10 +193,11 @@ class Brain:
         pred = sum(a * b for a, b in zip(self._weights(key), x))   # out-of-sample check first
         r["mse_model"] = ema(r["mse_model"], (y - pred) ** 2, 0.01)
         r["mse_zero"] = ema(r["mse_zero"], y * y, 0.01)
+        lam = 0.5 ** (1.0 / C.RIDGE_HALFLIFE_SAMPLES)      # forget old data gradually
         for i in range(N_FEATURES):
-            r["Xty"][i] += x[i] * y
+            r["Xty"][i] = lam * r["Xty"][i] + x[i] * y
             for j in range(N_FEATURES):
-                r["XtX"][i][j] += x[i] * x[j]
+                r["XtX"][i][j] = lam * r["XtX"][i][j] + x[i] * x[j]
         r["n"] += 1
 
     def alpha_active(self, key):
